@@ -1,0 +1,116 @@
+{
+  "name": "Interview Coach - Google Docs MCP",
+  "nodes": [
+    {
+      "parameters": {
+        "toolDescription": "Search interview stories, STAR examples, behavioral answers, and tech stack cheat sheets from the personal knowledge base. Use this whenever the user asks about interview questions, behavioral examples, leadership stories, technical background, or needs help practicing their answers.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string",
+              "description": "The interview question or topic to search for. Examples: 'leadership', 'conflict resolution', 'system design', 'failure story', 'tell me about yourself'"
+            },
+            "mode": {
+              "type": "string",
+              "enum": ["stories", "cheatsheet", "techstack", "all"],
+              "description": "Which section of the knowledge base to search. Use 'all' if unsure.",
+              "default": "all"
+            }
+          },
+          "required": ["query"]
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.mcpTrigger",
+      "typeVersion": 1,
+      "position": [240, 300],
+      "id": "mcp-trigger",
+      "name": "MCP Trigger",
+      "webhookId": "interview-coach-mcp"
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "documentURL": "={{ $('MCP Trigger').item.json.query ? 'https://docs.google.com/document/d/YOUR_DOCUMENT_ID_HERE' : '' }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleDocs",
+      "typeVersion": 2,
+      "position": [460, 300],
+      "id": "google-docs-read",
+      "name": "Read Knowledge Base",
+      "credentials": {
+        "googleDocsOAuth2Api": {
+          "id": "YOUR_GOOGLE_CREDENTIAL_ID",
+          "name": "Google Docs account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Get inputs\nconst query = $('MCP Trigger').item.json.query || '';\nconst mode = $('MCP Trigger').item.json.mode || 'all';\nconst queryLower = query.toLowerCase();\n\n// Extract plain text from Google Docs API response\nfunction extractText(content) {\n  if (!content || !Array.isArray(content)) return '';\n  let text = '';\n  for (const element of content) {\n    if (element.paragraph) {\n      for (const el of element.paragraph.elements || []) {\n        if (el.textRun && el.textRun.content) {\n          text += el.textRun.content;\n        }\n      }\n    } else if (element.table) {\n      for (const row of element.table.tableRows || []) {\n        for (const cell of row.tableCells || []) {\n          text += extractText(cell.content) + ' | ';\n        }\n        text += '\\n';\n      }\n    }\n  }\n  return text;\n}\n\nconst docBody = $('Read Knowledge Base').item.json.body;\nconst fullText = extractText(docBody ? docBody.content : []);\n\nif (!fullText || fullText.trim().length === 0) {\n  return [{ json: { \n    result: 'Could not read the knowledge base. Please check the Google Doc ID and permissions.',\n    query,\n    sectionsFound: 0\n  }}];\n}\n\n// Split document into sections by heading markers (# or ##)\nconst rawSections = fullText.split(/\\n(?=#+ )/);\n\n// Categorize sections\nconst storySection = [];\nconst cheatSection = [];\nconst techSection = [];\nconst otherSections = [];\n\nfor (const section of rawSections) {\n  const s = section.trim();\n  if (!s) continue;\n  const lower = s.toLowerCase();\n  if (lower.startsWith('# star') || lower.startsWith('## story') || lower.includes('star stories')) {\n    storySection.push(s);\n  } else if (lower.includes('cheat') || lower.includes('behavioral') || lower.includes('common question')) {\n    cheatSection.push(s);\n  } else if (lower.includes('tech stack') || lower.includes('technical') || lower.includes('skills')) {\n    techSection.push(s);\n  } else {\n    otherSections.push(s);\n  }\n}\n\n// Pick which sections to search based on mode\nlet searchPool;\nswitch (mode) {\n  case 'stories': searchPool = storySection; break;\n  case 'cheatsheet': searchPool = cheatSection; break;\n  case 'techstack': searchPool = techSection; break;\n  default: searchPool = rawSections;\n}\n\nif (searchPool.length === 0) searchPool = rawSections;\n\n// Score each section by keyword relevance\nconst queryWords = queryLower\n  .replace(/[^a-z0-9\\s]/g, '')\n  .split(' ')\n  .filter(w => w.length > 3);\n\n// Common interview keywords to boost\nconst interviewKeywords = [\n  'leadership', 'conflict', 'failure', 'success', 'challenge', \n  'team', 'project', 'result', 'impact', 'decision', 'difficult',\n  'proud', 'mistake', 'improve', 'learn', 'influence', 'prioritize',\n  'deadline', 'stakeholder', 'mentor', 'feedback', 'ambiguous'\n];\n\nconst scored = searchPool.map(section => {\n  const sectionLower = section.toLowerCase();\n  let score = 0;\n  \n  // Score query word matches\n  for (const word of queryWords) {\n    const count = (sectionLower.match(new RegExp(word, 'g')) || []).length;\n    score += count * 2;\n  }\n  \n  // Boost for interview keyword matches\n  for (const keyword of interviewKeywords) {\n    if (queryLower.includes(keyword) && sectionLower.includes(keyword)) {\n      score += 3;\n    }\n  }\n  \n  // Boost Story sections slightly\n  if (sectionLower.includes('## story') || sectionLower.includes('situation:')) {\n    score += 1;\n  }\n  \n  return { section: section.trim(), score };\n});\n\n// Get top 3 relevant sections\nconst topSections = scored\n  .filter(s => s.score > 0)\n  .sort((a, b) => b.score - a.score)\n  .slice(0, 3)\n  .map(s => s.section);\n\nlet result;\nif (topSections.length > 0) {\n  result = `Found ${topSections.length} relevant section(s) for \"${query}\":\\n\\n` + \n           topSections.join('\\n\\n---\\n\\n');\n} else {\n  // Fallback: return full doc summary\n  const preview = fullText.slice(0, 3000);\n  result = `No exact match for \"${query}\". Here is the full knowledge base:\\n\\n${preview}${\n    fullText.length > 3000 ? '\\n\\n[... document continues ...]' : ''\n  }`;\n}\n\nreturn [{ json: { \n  result,\n  query,\n  sectionsFound: topSections.length,\n  totalSections: rawSections.length\n}}];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [680, 300],
+      "id": "keyword-search",
+      "name": "Search & Filter"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ result: $json.result, meta: { query: $json.query, sectionsFound: $json.sectionsFound } }) }}"
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [900, 300],
+      "id": "mcp-response",
+      "name": "Return to MCP"
+    }
+  ],
+  "connections": {
+    "MCP Trigger": {
+      "main": [
+        [
+          {
+            "node": "Read Knowledge Base",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Knowledge Base": {
+      "main": [
+        [
+          {
+            "node": "Search & Filter",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search & Filter": {
+      "main": [
+        [
+          {
+            "node": "Return to MCP",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "instanceId": "interview-coach-gdocs"
+  },
+  "tags": ["interview", "mcp", "voice-agent", "google-docs"]
+}
